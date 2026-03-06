@@ -4,7 +4,7 @@
    ██║   ██║███╗██║██║   ██║██╔═══╝ ██║   ██║██║██║╚██╗██║   ██║   
    ██║   ╚███╔███╔╝╚██████╔╝██║     ╚██████╔╝██║██║ ╚████║   ██║   
    ╚═╝    ╚══╝╚══╝  ╚═════╝ ╚═╝      ╚═════╝ ╚═╝╚═╝  ╚═══╝   ╚═╝   
-       TwoPoint Development — Tucson Weather (IRL) + Time Sync (NOT IRL)
+       TwoPoint Development
 
 # TwoPoint_WeatherSync (v1.3.0)
 
