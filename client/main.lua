@@ -1,6 +1,8 @@
 local currentWeather = nil
 local currentWeatherMeta = nil
 
+local uiOpen = false
+
 local timeEnabled = Config.Time and Config.Time.Enabled
 local gmprm = (Config.Time and Config.Time.GameMinutesPerRealMinute) or 4
 local gsecsPerRealSec = gmprm
@@ -67,6 +69,43 @@ RegisterNetEvent('TwoPoint_WeatherSync:client:showTime', function(h, m, s, speed
   ) } })
 end)
 
+local function openForecastUI()
+  uiOpen = true
+  SetNuiFocus(true, true)
+  SetNuiFocusKeepInput(true)
+
+  local h = GetClockHours()
+  local m = GetClockMinutes()
+  local s = GetClockSeconds()
+
+  SendNUIMessage({
+    action = 'open',
+    weather = currentWeather or 'UNKNOWN',
+    meta = currentWeatherMeta or {},
+    gameTime = { hour = h, minute = m, second = s },
+  })
+end
+
+local function closeForecastUI()
+  uiOpen = false
+  SetNuiFocus(false, false)
+  SetNuiFocusKeepInput(false)
+  SendNUIMessage({ action = 'close' })
+end
+
+RegisterNUICallback('tpwx_close', function(_, cb)
+  closeForecastUI()
+  cb({ ok = true })
+end)
+
+RegisterCommand('weather', function()
+  if uiOpen then
+    closeForecastUI()
+  else
+    openForecastUI()
+  end
+end, false)
+
 CreateThread(function()
   -- Ask server for current state on join
   Wait(1500)
@@ -80,6 +119,18 @@ CreateThread(function()
       local elapsedRealSec = (GetGameTimer() - anchorClientMs) / 1000.0
       local predicted = anchorDaySeconds + (elapsedRealSec * gsecsPerRealSec)
       applyClockFromDaySeconds(predicted)
+    end
+
+    if uiOpen then
+      DisableControlAction(0, 1, true)
+      DisableControlAction(0, 2, true)
+      DisableControlAction(0, 24, true)
+      DisableControlAction(0, 25, true)
+      DisableControlAction(0, 200, true)
+
+      if IsControlJustPressed(0, 322) or IsControlJustPressed(0, 200) then
+        closeForecastUI()
+      end
     end
   end
 end)

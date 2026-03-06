@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Forecast</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app" class="hidden">
+    <div class="card">
+      <div class="header">
+        <div>
+          <div class="title">Forecast</div>
+          <div class="subtitle" id="subtitle">Tucson, AZ • Live</div>
+        </div>
+        <button id="closeBtn" class="close" aria-label="Close">
+          <span class="x">×</span>
+        </button>
+      </div>
+
+      <div class="main">
+        <div class="big" id="weatherText">—</div>
+        <div class="stats">
+          <div class="stat">
+            <div class="label">Temperature</div>
+            <div class="value" id="temp">—</div>
+          </div>
+          <div class="stat">
+            <div class="label">Wind</div>
+            <div class="value" id="wind">—</div>
+          </div>
+          <div class="stat">
+            <div class="label">Game Time</div>
+            <div class="value" id="gametime">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="footer">
+        <div class="muted" id="updated">Updated: —</div>
+        <div class="hint">Type <span class="kbd">/weather</span> to toggle • Press <span class="kbd">ESC</span> to close</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>

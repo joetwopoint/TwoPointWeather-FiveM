@@ -22,8 +22,117 @@ local function hmsFromDaySeconds(s)
 end
 
 -- ===========================
---  WEATHER (Open-Meteo)
+--  WEATHER (Mode: REAL or GTA cycles)
 -- ===========================
+local function getWeatherMode()
+  local w = Config.Weather or {}
+  local mode = w.Mode or w.mode or 'REAL'
+  mode = tostring(mode):upper()
+  if mode ~= 'REAL' and mode ~= 'GTA' then mode = 'REAL' end
+  return mode
+end
+
+local function getRealLatLon()
+  local w = Config.Weather or {}
+  local r = w.Real or {}
+  local lat = r.Latitude or Config.Latitude or 32.2226
+  local lon = r.Longitude or Config.Longitude or -110.9747
+  return lat, lon
+end
+
+local function getRealUpdateIntervalMinutes()
+  local w = Config.Weather or {}
+  local r = w.Real or {}
+  return tonumber(r.UpdateIntervalMinutes or Config.UpdateIntervalMinutes or 10) or 10
+end
+
+local function getGtaCycleConfig()
+  local w = Config.Weather or {}
+  return w.Gta or {}
+end
+
+local function resolveGtaWeights()
+  local g = getGtaCycleConfig()
+  local preset = tostring(g.Preset or 'VANILLA_LIKE'):upper()
+  if preset ~= 'CUSTOM' then
+    local presets = Config.WeatherPresets or {}
+    return presets[preset] or g.Weights or {}
+  end
+  return g.Weights or {}
+end
+
+
+local function getBlacklistSet()
+  local g = getGtaCycleConfig()
+  local bl = g.Blacklist
+  local set = {}
+  if type(bl) == 'table' then
+    for k, v in pairs(bl) do
+      if type(k) == 'number' then
+        if type(v) == 'string' then set[tostring(v):upper()] = true end
+      elseif type(k) == 'string' then
+        if v == true or v == 1 then set[tostring(k):upper()] = true end
+      end
+    end
+  end
+  return set
+end
+
+local function filterWeightsByBlacklist(weights, blacklist)
+  if not blacklist or next(blacklist) == nil then return weights or {} end
+  local out = {}
+  for k, v in pairs(weights or {}) do
+    local key = tostring(k):upper()
+    if not blacklist[key] then out[key] = v end
+  end
+  return out
+end
+
+local function pickFallbackWeather(blacklist)
+  local candidates = { 'CLEAR', 'EXTRASUNNY', 'CLOUDS', 'OVERCAST', 'SMOG', 'FOGGY', 'RAIN', 'THUNDER' }
+  for _, w in ipairs(candidates) do
+    if not (blacklist and blacklist[w]) then return w end
+  end
+  return Config.DefaultGTAWeather or 'CLEAR'
+end
+
+local function weightedPick(weights)
+  local total = 0
+  for _, v in pairs(weights or {}) do
+    local n = tonumber(v) or 0
+    if n > 0 then total = total + n end
+  end
+  if total <= 0 then return Config.DefaultGTAWeather end
+
+  local roll = math.random() * total
+  local acc = 0
+  for k, v in pairs(weights) do
+    local n = tonumber(v) or 0
+    if n > 0 then
+      acc = acc + n
+      if roll <= acc then return tostring(k) end
+    end
+  end
+  return Config.DefaultGTAWeather
+end
+
+local function clampInt(v, lo, hi)
+  v = tonumber(v) or lo
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
+end
+
+local function randomDurationSeconds()
+  local g = getGtaCycleConfig()
+  local minM = clampInt(g.MinDurationMinutes or 15, 1, 1440)
+  local maxM = clampInt(g.MaxDurationMinutes or 60, minM, 1440)
+  local durM = math.random(minM, maxM)
+  return durM * 60
+end
+
+-- Current weather state (used for both REAL and GTA modes)
+
 local currentWeather = Config.DefaultGTAWeather
 local currentWeatherMeta = {
   source = 'boot',
@@ -48,7 +157,8 @@ local function broadcastWeather(target)
 end
 
 local function fetchAndUpdateWeather()
-  local url = buildOpenMeteoUrl(Config.Latitude, Config.Longitude)
+  local lat, lon = getRealLatLon()
+  local url = buildOpenMeteoUrl(lat, lon)
   dbg(('Fetching weather: %s'):format(url))
 
   PerformHttpRequest(url, function(status, body)
@@ -75,8 +185,8 @@ local function fetchAndUpdateWeather()
     currentWeather = gtaWeather
     currentWeatherMeta = {
       source = 'open-meteo',
-      latitude = Config.Latitude,
-      longitude = Config.Longitude,
+      latitude = lat,
+      longitude = lon,
       fetchedAt = os.time(),
       localTime = cw.time, -- e.g. "2026-01-01T09:10"
       temperatureF = cw.temperature,
@@ -89,6 +199,99 @@ local function fetchAndUpdateWeather()
     broadcastWeather(-1)
   end, 'GET')
 end
+
+-- ===========================
+--  WEATHER (GTA cycles)
+-- ===========================
+local gtaNextChangeAt = 0
+local nextRealFetchAt = 0
+
+local function setWeatherState(newWeather, meta)
+  if not newWeather or newWeather == '' then return end
+  currentWeather = tostring(newWeather)
+  currentWeatherMeta = meta or {
+    source = 'unknown',
+    fetchedAt = os.time(),
+  }
+  broadcastWeather(-1)
+end
+
+local function tickGtaCycle()
+  local now = os.time()
+  if now < gtaNextChangeAt then return end
+
+  local g = getGtaCycleConfig()
+  local blacklist = getBlacklistSet()
+  local weights = filterWeightsByBlacklist(resolveGtaWeights(), blacklist)
+  local picked = weightedPick(weights)
+
+  if blacklist[tostring(picked):upper()] then
+    picked = pickFallbackWeather(blacklist)
+  end
+
+  if (g.AvoidRepeats == nil or g.AvoidRepeats == true) and picked == currentWeather then
+    -- Try a few times to avoid repeats
+    for _ = 1, 5 do
+      local again = weightedPick(weights)
+      if not blacklist[tostring(again):upper()] and again ~= currentWeather then
+        picked = again
+        break
+      end
+    end
+  end
+
+  local dur = randomDurationSeconds()
+  gtaNextChangeAt = now + dur
+
+  setWeatherState(picked, {
+    source = 'gta-cycle',
+    preset = tostring((g.Preset or 'VANILLA_LIKE')):upper(),
+    pickedAt = now,
+    nextChangeAt = gtaNextChangeAt,
+    durationSeconds = dur,
+  })
+
+  dbg(('GTA cycle weather -> %s (next change in %ss)'):format(tostring(picked), tostring(dur)))
+end
+
+local function tickRealWeather()
+  local now = os.time()
+  if now < nextRealFetchAt then return end
+
+  local intervalMin = getRealUpdateIntervalMinutes()
+  nextRealFetchAt = now + (intervalMin * 60)
+  fetchAndUpdateWeather()
+end
+
+-- Kick the scheduler immediately on resource start
+CreateThread(function()
+  Wait(1500)
+
+  -- Seed RNG for cycle mode
+  math.randomseed(os.time() + math.floor(math.random()*100000))
+
+  local mode = getWeatherMode()
+  dbg(('Weather mode: %s'):format(mode))
+
+  if mode == 'REAL' then
+    nextRealFetchAt = 0
+    tickRealWeather()
+  else
+    gtaNextChangeAt = 0
+    tickGtaCycle()
+  end
+
+  while true do
+    Wait(1000)
+
+    mode = getWeatherMode()
+    if mode == 'REAL' then
+      tickRealWeather()
+    else
+      tickGtaCycle()
+    end
+  end
+end)
 
 -- ===========================
 --  TIME (Synced, NOT IRL)
@@ -172,15 +375,6 @@ RegisterCommand('twopoint_settime', function(source, args)
 end, false)
 
 -- Threads
-CreateThread(function()
-  Wait(1500)
-  fetchAndUpdateWeather()
-
-  while true do
-    Wait((Config.UpdateIntervalMinutes or 10) * 60 * 1000)
-    fetchAndUpdateWeather()
-  end
-end)
 
 CreateThread(function()
   if not timeEnabled then return end

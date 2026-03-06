@@ -6,20 +6,85 @@ Config = {}
 Config.Debug = false
 
 -- ===========================
---  REAL WEATHER SOURCE
+--  WEATHER MODE
 -- ===========================
--- Tucson, Arizona (downtown-ish)
-Config.Latitude  = 32.2226
-Config.Longitude = -110.9747
+-- "REAL" = Sync weather from a real-world location (anywhere)
+-- "GTA"  = Server-controlled GTA-style weather cycles (fully synced for everyone, no API calls)
+Config.Weather = {
+  Mode = "REAL",
 
--- Refresh real-world weather every X minutes
-Config.UpdateIntervalMinutes = 10
+  -- Used only when Mode = "REAL"
+  Real = {
+    -- Default: Tucson, Arizona (downtown-ish)
+    Latitude  = 32.2226,
+    Longitude = -110.9747,
+
+    -- Refresh real-world weather every X minutes
+    UpdateIntervalMinutes = 10,
+  },
+
+  -- Used only when Mode = "GTA"
+  Gta = {
+    -- Presets: "VANILLA_LIKE", "DESERT", "STORMY", "CUSTOM"
+    Preset = "VANILLA_LIKE",
+
+    -- How long each weather lasts (server chooses + syncs to all)
+    MinDurationMinutes = 15,
+    MaxDurationMinutes = 60,
+
+    -- Weather blacklist (skip these in GTA cycle mode)
+    -- You can list any GTA weather types here, e.g. { "RAIN", "THUNDER", "SNOW" }
+    -- Types: EXTRASUNNY, CLEAR, CLOUDS, OVERCAST, RAIN, THUNDER, SMOG, FOGGY, XMAS, SNOWLIGHT, BLIZZARD, etc.
+    Blacklist = {
+      -- "RAIN",
+      -- "THUNDER",
+      -- "XMAS",
+    },
+
+    -- Used only when Preset = "CUSTOM"
+    -- Higher number = more likely
+    Weights = {
+      EXTRASUNNY = 30,
+      CLEAR      = 30,
+      CLOUDS     = 20,
+      OVERCAST   = 10,
+      RAIN       = 7,
+      THUNDER    = 3,
+
+      -- Tucson/Arizona vibe: keep these at 0 unless you really want them
+      FOGGY      = 0,
+      SNOWLIGHT  = 0,
+      SNOW       = 0,
+      BLIZZARD   = 0,
+      XMAS       = 0,
+    },
+
+    -- If true, the cycle will try not to repeat the same weather twice in a row
+    AvoidRepeats = true,
+  }
+}
 
 -- Smooth transition time when changing weather (minutes)
 Config.WeatherTransitionMinutes = 2
 
--- If a code isn't mapped, fall back to this GTA weather type
+-- If a weather type isn't mapped, fall back to this GTA weather type
 Config.DefaultGTAWeather = 'CLEAR'
+
+-- Built-in preset weights (feel free to edit)
+Config.WeatherPresets = {
+  VANILLA_LIKE = {
+    EXTRASUNNY = 30, CLEAR = 30, CLOUDS = 20, OVERCAST = 10, RAIN = 7, THUNDER = 3,
+    FOGGY = 0, SMOG = 0, SNOWLIGHT = 0, SNOW = 0, BLIZZARD = 0, XMAS = 0
+  },
+  DESERT = {
+    EXTRASUNNY = 45, CLEAR = 35, CLOUDS = 12, OVERCAST = 5, RAIN = 2, THUNDER = 1,
+    FOGGY = 0, SMOG = 0, SNOWLIGHT = 0, SNOW = 0, BLIZZARD = 0, XMAS = 0
+  },
+  STORMY = {
+    OVERCAST = 30, RAIN = 35, THUNDER = 20, CLOUDS = 10, CLEAR = 3, EXTRASUNNY = 2,
+    FOGGY = 0, SMOG = 0, SNOWLIGHT = 0, SNOW = 0, BLIZZARD = 0, XMAS = 0
+  },
+}
 
 -- ===========================
 --  TIME SYNC (SERVER-AUTHORITY)

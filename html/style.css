@@ -1,0 +1,147 @@
+:root {
+  --bg: rgba(12, 14, 18, 0.65);
+  --card: rgba(24, 27, 35, 0.88);
+  --stroke: rgba(255,255,255,0.10);
+  --text: rgba(255,255,255,0.92);
+  --muted: rgba(255,255,255,0.70);
+  --muted2: rgba(255,255,255,0.55);
+  --shadow: 0 12px 40px rgba(0,0,0,0.45);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--text);
+}
+
+.hidden { display: none; }
+
+#app {
+  width: min(560px, 92vw);
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  backdrop-filter: blur(10px);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 18px 12px 18px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0));
+}
+
+.title {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.subtitle {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--muted2);
+}
+
+.close {
+  appearance: none;
+  border: 1px solid var(--stroke);
+  background: rgba(0,0,0,0.18);
+  color: var(--text);
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.close:hover {
+  background: rgba(0,0,0,0.28);
+}
+
+.x {
+  display: inline-block;
+  font-size: 22px;
+  line-height: 1;
+  transform: translateY(-1px);
+}
+
+.main {
+  padding: 14px 18px 14px 18px;
+}
+
+.big {
+  font-size: 36px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  margin-bottom: 14px;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.stat {
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid var(--stroke);
+  background: rgba(255,255,255,0.03);
+}
+
+.label {
+  font-size: 12px;
+  color: var(--muted2);
+  margin-bottom: 6px;
+}
+
+.value {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.footer {
+  border-top: 1px solid var(--stroke);
+  padding: 12px 18px 16px 18px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+.hint {
+  color: var(--muted2);
+  font-size: 12px;
+}
+
+.kbd {
+  border: 1px solid var(--stroke);
+  padding: 2px 7px;
+  border-radius: 8px;
+  background: rgba(0,0,0,0.18);
+  color: var(--text);
+}
+
+@media (max-width: 520px) {
+  .stats { grid-template-columns: 1fr; }
+  .big { font-size: 30px; }
+}
