@@ -1,405 +1,761 @@
-local function dbg(msg)
-  if Config.Debug then
-    print(('[TwoPoint_WeatherSync] %s'):format(msg))
-  end
-end
+-- TwoPointWeather server authority
+-- Built and maintained by TwoPoint Development.
 
--- ===========================
---  HELPERS
--- ===========================
-local function clampDaySeconds(s)
-  s = s % 86400
-  if s < 0 then s = s + 86400 end
-  return s
-end
+local RESOURCE = GetCurrentResourceName()
+local DAY_MINUTES = 24 * 60
+local SYNC_EVENT = RESOURCE .. ':client:sync'
+local REQUEST_EVENT = RESOURCE .. ':server:requestSync'
+local ACK_EVENT = RESOURCE .. ':server:syncAck'
+local FORCE_WEATHER_EVENT = RESOURCE .. ':client:forceWeatherReset'
 
-local function hmsFromDaySeconds(s)
-  s = clampDaySeconds(s)
-  local h = math.floor(s / 3600)
-  local m = math.floor((s % 3600) / 60)
-  local sec = math.floor(s % 60)
-  return h, m, sec
-end
+math.randomseed(os.time())
+math.random(); math.random(); math.random()
 
--- ===========================
---  WEATHER (Mode: REAL or GTA cycles)
--- ===========================
-local function getWeatherMode()
-  local w = Config.Weather or {}
-  local mode = w.Mode or w.mode or 'REAL'
-  mode = tostring(mode):upper()
-  if mode ~= 'REAL' and mode ~= 'GTA' then mode = 'REAL' end
-  return mode
-end
-
-local function getRealLatLon()
-  local w = Config.Weather or {}
-  local r = w.Real or {}
-  local lat = r.Latitude or Config.Latitude or 32.2226
-  local lon = r.Longitude or Config.Longitude or -110.9747
-  return lat, lon
-end
-
-local function getRealUpdateIntervalMinutes()
-  local w = Config.Weather or {}
-  local r = w.Real or {}
-  return tonumber(r.UpdateIntervalMinutes or Config.UpdateIntervalMinutes or 10) or 10
-end
-
-local function getGtaCycleConfig()
-  local w = Config.Weather or {}
-  return w.Gta or {}
-end
-
-local function resolveGtaWeights()
-  local g = getGtaCycleConfig()
-  local preset = tostring(g.Preset or 'VANILLA_LIKE'):upper()
-  if preset ~= 'CUSTOM' then
-    local presets = Config.WeatherPresets or {}
-    return presets[preset] or g.Weights or {}
-  end
-  return g.Weights or {}
-end
-
-
-local function getBlacklistSet()
-  local g = getGtaCycleConfig()
-  local bl = g.Blacklist
-  local set = {}
-  if type(bl) == 'table' then
-    for k, v in pairs(bl) do
-      if type(k) == 'number' then
-        if type(v) == 'string' then set[tostring(v):upper()] = true end
-      elseif type(k) == 'string' then
-        if v == true or v == 1 then set[tostring(k):upper()] = true end
-      end
+local function debugLog(message)
+    if Config.Debug then
+        print(('[%s] %s'):format(RESOURCE, message))
     end
-  end
-  return set
 end
 
-local function filterWeightsByBlacklist(weights, blacklist)
-  if not blacklist or next(blacklist) == nil then return weights or {} end
-  local out = {}
-  for k, v in pairs(weights or {}) do
-    local key = tostring(k):upper()
-    if not blacklist[key] then out[key] = v end
-  end
-  return out
-end
-
-local function pickFallbackWeather(blacklist)
-  local candidates = { 'CLEAR', 'EXTRASUNNY', 'CLOUDS', 'OVERCAST', 'SMOG', 'FOGGY', 'RAIN', 'THUNDER' }
-  for _, w in ipairs(candidates) do
-    if not (blacklist and blacklist[w]) then return w end
-  end
-  return Config.DefaultGTAWeather or 'CLEAR'
-end
-
-local function weightedPick(weights)
-  local total = 0
-  for _, v in pairs(weights or {}) do
-    local n = tonumber(v) or 0
-    if n > 0 then total = total + n end
-  end
-  if total <= 0 then return Config.DefaultGTAWeather end
-
-  local roll = math.random() * total
-  local acc = 0
-  for k, v in pairs(weights) do
-    local n = tonumber(v) or 0
-    if n > 0 then
-      acc = acc + n
-      if roll <= acc then return tostring(k) end
+local function normalizeMinutes(value)
+    value = value % DAY_MINUTES
+    if value < 0 then
+        value = value + DAY_MINUTES
     end
-  end
-  return Config.DefaultGTAWeather
+    return value
 end
 
-local function clampInt(v, lo, hi)
-  v = tonumber(v) or lo
-  if v < lo then return lo end
-  if v > hi then return hi end
-  return v
+local function shortestMinuteDelta(fromMinutes, toMinutes)
+    return ((toMinutes - fromMinutes + 720) % DAY_MINUTES) - 720
 end
 
-local function randomDurationSeconds()
-  local g = getGtaCycleConfig()
-  local minM = clampInt(g.MinDurationMinutes or 15, 1, 1440)
-  local maxM = clampInt(g.MaxDurationMinutes or 60, minM, 1440)
-  local durM = math.random(minM, maxM)
-  return durM * 60
+local function randomWeatherDurationSeconds()
+    local minMinutes = math.max(1, tonumber(Config.Dynamic.MinDurationMinutes) or 15)
+    local maxMinutes = math.max(minMinutes, tonumber(Config.Dynamic.MaxDurationMinutes) or minMinutes)
+    return math.random(minMinutes, maxMinutes) * 60
 end
 
--- Current weather state (used for both REAL and GTA modes)
+local initialMinutes = normalizeMinutes((Config.Time.StartHour * 60) + Config.Time.StartMinute)
+local now = os.time()
 
-local currentWeather = Config.DefaultGTAWeather
-local currentWeatherMeta = {
-  source = 'boot',
-  weatherCode = nil,
-  temperatureF = nil,
-  windSpeedMph = nil,
-  fetchedAt = os.time(),
+local packetSequence = 0
+local stateRevision = 1
+local clientAcks = {}
+local requestRateLimit = {}
+
+local state = {
+    weather = string.upper(Config.Dynamic.InitialWeather or 'CLEAR'),
+    weatherTransition = nil,
+    weatherEndsAt = now + randomWeatherDurationSeconds(),
+    dynamicEnabled = Config.Dynamic.Enabled == true,
+    manualUntil = 0,
+    forecast = {},
+
+    time = {
+        baseMinutes = initialMinutes,
+        baseUnix = now,
+        speed = tonumber(Config.Time.MinutesPerRealMinute) or 2.0,
+        frozen = Config.Time.Frozen == true,
+        transition = nil
+    }
 }
 
-local function buildOpenMeteoUrl(lat, lon)
-  return ('https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=auto')
-    :format(tostring(lat), tostring(lon))
-end
+local function getCurrentTimeMinutes(atUnix)
+    atUnix = atUnix or os.time()
+    local timeState = state.time
+    local transition = timeState.transition
 
-local function mapWeatherCodeToGTA(code)
-  local mapped = Config.OpenMeteoCodeToGTA[tonumber(code or -1)]
-  return mapped or Config.DefaultGTAWeather
-end
-
-local function broadcastWeather(target)
-  TriggerClientEvent('TwoPoint_WeatherSync:client:setWeather', target or -1, currentWeather, Config.WeatherTransitionMinutes, currentWeatherMeta)
-end
-
-local function fetchAndUpdateWeather()
-  local lat, lon = getRealLatLon()
-  local url = buildOpenMeteoUrl(lat, lon)
-  dbg(('Fetching weather: %s'):format(url))
-
-  PerformHttpRequest(url, function(status, body)
-    if status ~= 200 or not body or body == '' then
-      dbg(('Weather fetch failed (status=%s)'):format(tostring(status)))
-      return
+    if transition then
+        local elapsed = math.max(0, atUnix - transition.startedAt)
+        local progress = math.min(1.0, elapsed / transition.duration)
+        return normalizeMinutes(transition.fromMinutes + (transition.deltaMinutes * progress))
     end
 
-    local ok, data = pcall(function() return json.decode(body) end)
-    if not ok or not data then
-      dbg('Weather decode failed')
-      return
+    if timeState.frozen then
+        return normalizeMinutes(timeState.baseMinutes)
     end
 
-    local cw = data.current_weather
-    if not cw then
-      dbg('Weather payload missing current_weather')
-      return
+    local elapsedSeconds = math.max(0, atUnix - timeState.baseUnix)
+    local elapsedGameMinutes = elapsedSeconds * (timeState.speed / 60.0)
+    return normalizeMinutes(timeState.baseMinutes + elapsedGameMinutes)
+end
+
+local function finalizeTimeTransition(atUnix)
+    local transition = state.time.transition
+    if not transition or atUnix < transition.endsAt then
+        return false
     end
 
-    local weatherCode = cw.weathercode
-    local gtaWeather = mapWeatherCodeToGTA(weatherCode)
+    state.time.baseMinutes = normalizeMinutes(transition.targetMinutes)
+    state.time.baseUnix = transition.endsAt
+    state.time.transition = nil
+    return true
+end
 
-    currentWeather = gtaWeather
-    currentWeatherMeta = {
-      source = 'open-meteo',
-      latitude = lat,
-      longitude = lon,
-      fetchedAt = os.time(),
-      localTime = cw.time, -- e.g. "2026-01-01T09:10"
-      temperatureF = cw.temperature,
-      windSpeedMph = cw.windspeed,
-      windDirection = cw.winddirection,
-      weatherCode = weatherCode,
+local function pickWeightedWeather(currentWeather)
+    local options = Config.WeatherTransitions[currentWeather]
+    if not options or #options == 0 then
+        options = Config.WeatherTransitions.CLEAR
+    end
+
+    local totalWeight = 0
+    for i = 1, #options do
+        totalWeight = totalWeight + math.max(0, tonumber(options[i].weight) or 0)
+    end
+
+    if totalWeight <= 0 then
+        return 'CLEAR'
+    end
+
+    local roll = math.random() * totalWeight
+    local cumulative = 0
+
+    for i = 1, #options do
+        cumulative = cumulative + math.max(0, tonumber(options[i].weight) or 0)
+        if roll <= cumulative then
+            return string.upper(options[i].weather)
+        end
+    end
+
+    return string.upper(options[#options].weather)
+end
+
+local function rebuildForecast()
+    state.forecast = {}
+    local cursor = state.weatherTransition and state.weatherTransition.toWeather or state.weather
+
+    for _ = 1, math.max(1, Config.Dynamic.ForecastLength or 6) do
+        local nextWeather = pickWeightedWeather(cursor)
+        state.forecast[#state.forecast + 1] = {
+            weather = nextWeather,
+            durationSeconds = randomWeatherDurationSeconds(),
+            transitionSeconds = math.max(1, Config.Dynamic.TransitionSeconds or 60)
+        }
+        cursor = nextWeather
+    end
+end
+
+local function ensureForecast()
+    local wanted = math.max(1, Config.Dynamic.ForecastLength or 6)
+    local cursor
+
+    if #state.forecast > 0 then
+        cursor = state.forecast[#state.forecast].weather
+    else
+        cursor = state.weatherTransition and state.weatherTransition.toWeather or state.weather
+    end
+
+    while #state.forecast < wanted do
+        local nextWeather = pickWeightedWeather(cursor)
+        state.forecast[#state.forecast + 1] = {
+            weather = nextWeather,
+            durationSeconds = randomWeatherDurationSeconds(),
+            transitionSeconds = math.max(1, Config.Dynamic.TransitionSeconds or 60)
+        }
+        cursor = nextWeather
+    end
+end
+
+local function getWeatherProgress(atUnix)
+    local transition = state.weatherTransition
+    if not transition then
+        return 1.0
+    end
+
+    return math.min(1.0, math.max(0, atUnix - transition.startedAt) / transition.duration)
+end
+
+local function buildForecastPayload()
+    local payload = {}
+    local startAt = state.weatherEndsAt
+
+    if state.weatherTransition then
+        startAt = state.weatherTransition.endsAt + state.weatherTransition.holdSeconds
+    end
+
+    for i = 1, #state.forecast do
+        local entry = state.forecast[i]
+        payload[#payload + 1] = {
+            weather = entry.weather,
+            startsAt = startAt,
+            durationSeconds = entry.durationSeconds,
+            transitionSeconds = entry.transitionSeconds
+        }
+        startAt = startAt + entry.transitionSeconds + entry.durationSeconds
+    end
+
+    return payload
+end
+
+local function buildPayload()
+    local atUnix = os.time()
+    local currentMinutes = getCurrentTimeMinutes(atUnix)
+    local timeTransition = state.time.transition
+    local weatherTransition = state.weatherTransition
+
+    local payload = {
+        packet = 0,
+        revision = stateRevision,
+        serverEpoch = atUnix,
+        serverTimer = GetGameTimer(),
+        weather = {
+            current = state.weather,
+            dynamicEnabled = state.dynamicEnabled,
+            manualUntil = state.manualUntil,
+            nextChangeAt = state.weatherEndsAt,
+            transition = nil,
+            forecast = buildForecastPayload()
+        },
+        time = {
+            currentMinutes = currentMinutes,
+            speed = state.time.speed,
+            frozen = state.time.frozen,
+            transition = nil
+        }
     }
 
-    dbg(('Weather updated: code=%s -> %s'):format(tostring(weatherCode), tostring(gtaWeather)))
-    broadcastWeather(-1)
-  end, 'GET')
-end
-
--- ===========================
---  WEATHER (GTA cycles)
--- ===========================
-local gtaNextChangeAt = 0
-local nextRealFetchAt = 0
-
-local function setWeatherState(newWeather, meta)
-  if not newWeather or newWeather == '' then return end
-  currentWeather = tostring(newWeather)
-  currentWeatherMeta = meta or {
-    source = 'unknown',
-    fetchedAt = os.time(),
-  }
-  broadcastWeather(-1)
-end
-
-local function tickGtaCycle()
-  local now = os.time()
-  if now < gtaNextChangeAt then return end
-
-  local g = getGtaCycleConfig()
-  local blacklist = getBlacklistSet()
-  local weights = filterWeightsByBlacklist(resolveGtaWeights(), blacklist)
-  local picked = weightedPick(weights)
-
-  if blacklist[tostring(picked):upper()] then
-    picked = pickFallbackWeather(blacklist)
-  end
-
-  if (g.AvoidRepeats == nil or g.AvoidRepeats == true) and picked == currentWeather then
-    -- Try a few times to avoid repeats
-    for _ = 1, 5 do
-      local again = weightedPick(weights)
-      if not blacklist[tostring(again):upper()] and again ~= currentWeather then
-        picked = again
-        break
-      end
+    if weatherTransition then
+        payload.weather.transition = {
+            id = weatherTransition.id,
+            fromWeather = weatherTransition.fromWeather,
+            toWeather = weatherTransition.toWeather,
+            duration = weatherTransition.duration,
+            remaining = math.max(0, weatherTransition.endsAt - atUnix),
+            progress = getWeatherProgress(atUnix)
+        }
     end
-  end
 
-  local dur = randomDurationSeconds()
-  gtaNextChangeAt = now + dur
+    if timeTransition then
+        payload.time.transition = {
+            targetMinutes = timeTransition.targetMinutes,
+            remaining = math.max(0, timeTransition.endsAt - atUnix),
+            deltaRemaining = shortestMinuteDelta(currentMinutes, timeTransition.targetMinutes)
+        }
+    end
 
-  setWeatherState(picked, {
-    source = 'gta-cycle',
-    preset = tostring((g.Preset or 'VANILLA_LIKE')):upper(),
-    pickedAt = now,
-    nextChangeAt = gtaNextChangeAt,
-    durationSeconds = dur,
-  })
-
-  dbg(('GTA cycle weather -> %s (next change in %ss)'):format(tostring(picked), tostring(dur)))
+    return payload
 end
 
-local function tickRealWeather()
-  local now = os.time()
-  if now < nextRealFetchAt then return end
-
-  local intervalMin = getRealUpdateIntervalMinutes()
-  nextRealFetchAt = now + (intervalMin * 60)
-  fetchAndUpdateWeather()
+local function updateGlobalState(payload)
+    payload = payload or buildPayload()
+    GlobalState.TwoPointWeather = payload
+    GlobalState.syncedWeather = payload.weather
+    GlobalState.syncedTime = payload.time
 end
 
--- Kick the scheduler immediately on resource start
-CreateThread(function()
-  Wait(1500)
+local function broadcastState(target, requestId, echoedClientTimer)
+    packetSequence = packetSequence + 1
+    local payload = buildPayload()
+    payload.packet = packetSequence
 
-  -- Seed RNG for cycle mode
-  math.randomseed(os.time() + math.floor(math.random()*100000))
+    if requestId ~= nil then
+        payload.request = {
+            id = requestId,
+            clientSentAt = tonumber(echoedClientTimer)
+        }
+    end
 
-  local mode = getWeatherMode()
-  dbg(('Weather mode: %s'):format(mode))
-
-  if mode == 'REAL' then
-    nextRealFetchAt = 0
-    tickRealWeather()
-  else
-    gtaNextChangeAt = 0
-    tickGtaCycle()
-  end
-
-  while true do
-    Wait(1000)
-
-    mode = getWeatherMode()
-    if mode == 'REAL' then
-      tickRealWeather()
+    if target and target ~= -1 then
+        TriggerClientEvent(SYNC_EVENT, target, payload)
     else
-      tickGtaCycle()
+        for _, playerId in ipairs(GetPlayers()) do
+            TriggerClientEvent(SYNC_EVENT, tonumber(playerId), payload)
+        end
     end
-  end
+
+    updateGlobalState(payload)
+end
+
+local function forceWeatherReset(target)
+    packetSequence = packetSequence + 1
+    local payload = buildPayload()
+    payload.packet = packetSequence
+
+    if target and target ~= -1 then
+        TriggerClientEvent(FORCE_WEATHER_EVENT, target, payload)
+    else
+        for _, playerId in ipairs(GetPlayers()) do
+            TriggerClientEvent(FORCE_WEATHER_EVENT, tonumber(playerId), payload)
+        end
+    end
+
+    updateGlobalState(payload)
+end
+
+local function publishState()
+    stateRevision = stateRevision + 1
+    broadcastState(-1)
+end
+
+local transitionCounter = 0
+
+local function beginWeatherTransition(targetWeather, durationSeconds, holdSeconds, reason)
+    targetWeather = string.upper(tostring(targetWeather or ''))
+    if not Config.ValidWeather[targetWeather] then
+        return false, 'invalid_weather'
+    end
+
+    local atUnix = os.time()
+    local fromWeather = state.weather
+
+    if state.weatherTransition then
+        local progress = getWeatherProgress(atUnix)
+        fromWeather = progress >= 0.5 and state.weatherTransition.toWeather or state.weatherTransition.fromWeather
+    end
+
+    durationSeconds = math.max(1, math.floor(tonumber(durationSeconds) or Config.CommandTransitionSeconds or 60))
+    holdSeconds = math.max(0, math.floor(tonumber(holdSeconds) or randomWeatherDurationSeconds()))
+
+    transitionCounter = transitionCounter + 1
+
+    state.weather = fromWeather
+    state.weatherTransition = {
+        id = ('%d:%d'):format(atUnix, transitionCounter),
+        fromWeather = fromWeather,
+        toWeather = targetWeather,
+        startedAt = atUnix,
+        endsAt = atUnix + durationSeconds,
+        duration = durationSeconds,
+        holdSeconds = holdSeconds,
+        reason = reason or 'unknown'
+    }
+    state.weatherEndsAt = state.weatherTransition.endsAt + holdSeconds
+
+    rebuildForecast()
+    publishState()
+    debugLog(('Weather transition %s -> %s over %ss (%s)'):format(fromWeather, targetWeather, durationSeconds, reason or 'unknown'))
+    return true
+end
+
+local function finalizeWeatherTransition(atUnix)
+    local transition = state.weatherTransition
+    if not transition or atUnix < transition.endsAt then
+        return false
+    end
+
+    state.weather = transition.toWeather
+    state.weatherEndsAt = transition.endsAt + transition.holdSeconds
+    state.weatherTransition = nil
+    ensureForecast()
+    return true
+end
+
+local function setTimeTarget(hour, minute, durationSeconds)
+    hour = tonumber(hour)
+    minute = tonumber(minute) or 0
+
+    if not hour or hour < 0 or hour > 23 or minute < 0 or minute > 59 then
+        return false, 'invalid_time'
+    end
+
+    local atUnix = os.time()
+    finalizeTimeTransition(atUnix)
+
+    local fromMinutes = getCurrentTimeMinutes(atUnix)
+    local targetMinutes = normalizeMinutes((math.floor(hour) * 60) + math.floor(minute))
+    local duration = math.max(1, math.floor(tonumber(durationSeconds) or Config.Time.TransitionSeconds or 60))
+
+    state.time.transition = {
+        fromMinutes = fromMinutes,
+        targetMinutes = targetMinutes,
+        deltaMinutes = shortestMinuteDelta(fromMinutes, targetMinutes),
+        startedAt = atUnix,
+        endsAt = atUnix + duration,
+        duration = duration
+    }
+
+    publishState()
+    return true
+end
+
+local function freezeTime(shouldFreeze)
+    local atUnix = os.time()
+    local currentMinutes = getCurrentTimeMinutes(atUnix)
+
+    state.time.baseMinutes = currentMinutes
+    state.time.baseUnix = atUnix
+    state.time.transition = nil
+    state.time.frozen = shouldFreeze == true
+
+    publishState()
+end
+
+local function hasPermission(playerSource)
+    return playerSource == 0 or IsPlayerAceAllowed(playerSource, Config.AdminAce)
+end
+
+local function reply(playerSource, message, kind)
+    if playerSource == 0 then
+        print(('[%s] %s'):format(RESOURCE, message))
+        return
+    end
+
+    TriggerClientEvent('chat:addMessage', playerSource, {
+        color = kind == 'error' and { 255, 80, 80 } or { 100, 190, 255 },
+        args = { 'Weather', message }
+    })
+end
+
+local function getSyncCounts(requireWeatherMatch)
+    if requireWeatherMatch == nil then
+        requireWeatherMatch = true
+    end
+
+    local players = GetPlayers()
+    local acknowledged = 0
+    local paused = 0
+    local missing = {}
+    local mismatched = {}
+    local timeout = math.max(10, tonumber(Config.AckTimeoutSeconds) or 15)
+    local nowUnix = os.time()
+
+    for _, playerIdString in ipairs(players) do
+        local playerId = tonumber(playerIdString)
+        local ack = clientAcks[playerId]
+        local recentAndApplied = ack
+            and ack.applied == true
+            and ack.revision == stateRevision
+            and (nowUnix - ack.receivedAt) <= timeout
+        local weatherOkay = not requireWeatherMatch or (ack and ack.weatherMatched == true)
+        local valid = recentAndApplied and weatherOkay
+
+        if valid then
+            acknowledged = acknowledged + 1
+        else
+            if ack and ack.paused then
+                paused = paused + 1
+            end
+            missing[#missing + 1] = tostring(playerId)
+
+            if ack and recentAndApplied and ack.weatherMatched ~= true then
+                local conflicts = ack.conflicts and #ack.conflicts > 0 and table.concat(ack.conflicts, ',') or 'none'
+                mismatched[#mismatched + 1] = ('%d[%s>%s p=%s rain=%s snow=%s fixes=%d conflicts=%s]'):format(
+                    playerId,
+                    ack.observedPrevious or '?',
+                    ack.observedNext or '?',
+                    ack.observedProgress and ('%.2f'):format(ack.observedProgress) or '?',
+                    ack.rainLevel and ('%.2f'):format(ack.rainLevel) or '?',
+                    ack.snowLevel and ('%.2f'):format(ack.snowLevel) or '?',
+                    ack.corrections or 0,
+                    conflicts
+                )
+            end
+        end
+    end
+
+    return acknowledged, #players, paused, missing, mismatched
+end
+
+RegisterNetEvent(REQUEST_EVENT, function(requestId, clientTimer)
+    local playerSource = source
+    local currentTimer = GetGameTimer()
+    local previous = requestRateLimit[playerSource] or 0
+
+    if currentTimer - previous < 200 then
+        return
+    end
+
+    requestRateLimit[playerSource] = currentTimer
+    broadcastState(playerSource, requestId, clientTimer)
 end)
 
--- ===========================
---  TIME (Synced, NOT IRL)
--- ===========================
-local timeEnabled = Config.Time and Config.Time.Enabled
-local gmprm = (Config.Time and Config.Time.GameMinutesPerRealMinute) or 4
-local gsecsPerRealSec = gmprm -- 1 real second -> gmprm game seconds
-local currentDaySeconds = clampDaySeconds(
-  ((Config.Time.StartHour or 12) * 3600) +
-  ((Config.Time.StartMinute or 0) * 60) +
-  (Config.Time.StartSecond or 0)
-)
+RegisterNetEvent(ACK_EVENT, function(ack)
+    local playerSource = source
+    if type(ack) ~= 'table' then
+        return
+    end
 
-local lastTimeBroadcast = 0
-
-local function broadcastTimeAnchor(target)
-  if not timeEnabled then return end
-  -- Send an anchor (server day seconds + server unix time) so clients can simulate smoothly.
-  TriggerClientEvent('TwoPoint_WeatherSync:client:setTimeAnchor', target or -1, currentDaySeconds, os.time())
-end
-
-local function setTime(h, m, s)
-  h = tonumber(h) or 0
-  m = tonumber(m) or 0
-  s = tonumber(s) or 0
-  if h < 0 then h = 0 elseif h > 23 then h = 23 end
-  if m < 0 then m = 0 elseif m > 59 then m = 59 end
-  if s < 0 then s = 0 elseif s > 59 then s = 59 end
-
-  currentDaySeconds = clampDaySeconds(h * 3600 + m * 60 + s)
-  broadcastTimeAnchor(-1)
-end
-
--- Client sync request on spawn
-RegisterNetEvent('TwoPoint_WeatherSync:server:requestSync', function()
-  local src = source
-  broadcastWeather(src)
-  broadcastTimeAnchor(src)
+    clientAcks[playerSource] = {
+        packet = tonumber(ack.packet) or 0,
+        revision = tonumber(ack.revision) or 0,
+        receivedAt = os.time(),
+        applied = ack.applied == true,
+        paused = ack.paused == true,
+        weather = tostring(ack.weather or ''),
+        weatherProgress = tonumber(ack.weatherProgress),
+        observedPrevious = tostring(ack.observedPrevious or ''),
+        observedNext = tostring(ack.observedNext or ''),
+        observedProgress = tonumber(ack.observedProgress),
+        rainLevel = tonumber(ack.rainLevel),
+        snowLevel = tonumber(ack.snowLevel),
+        weatherMatched = ack.weatherMatched == true,
+        mismatchStreak = tonumber(ack.mismatchStreak) or 0,
+        corrections = tonumber(ack.corrections) or 0,
+        conflicts = type(ack.conflicts) == 'table' and ack.conflicts or {},
+        timeMinutes = tonumber(ack.timeMinutes),
+        rtt = tonumber(ack.rtt)
+    }
 end)
 
--- Commands
-RegisterCommand('wx', function(source)
-  TriggerClientEvent('TwoPoint_WeatherSync:client:showWeather', source, currentWeather, currentWeatherMeta)
-end, false)
+AddEventHandler('playerDropped', function()
+    clientAcks[source] = nil
+    requestRateLimit[source] = nil
+end)
 
--- Backwards-compatible alias
-RegisterCommand('twopoint_wx', function(source)
-  TriggerClientEvent('TwoPoint_WeatherSync:client:showWeather', source, currentWeather, currentWeatherMeta)
-end, false)
+AddEventHandler('playerJoining', function()
+    local playerSource = source
+    SetTimeout(3000, function()
+        if GetPlayerName(playerSource) then
+            broadcastState(playerSource)
+        end
+    end)
+end)
 
-RegisterCommand('twopoint_time', function(source)
-  local h, m, s = hmsFromDaySeconds(currentDaySeconds)
-  TriggerClientEvent('TwoPoint_WeatherSync:client:showTime', source, h, m, s, gmprm)
-end, false)
-
-RegisterCommand('twopoint_settime', function(source, args)
-  local src = source
-  if src ~= 0 then
-    local ace = (Config.Time and Config.Time.AdminAce) or 'twopoint.weather.admin'
-    if not IsPlayerAceAllowed(src, ace) then
-      TriggerClientEvent('chat:addMessage', src, { args = { '^1TwoPoint', 'No permission.' } })
-      return
+RegisterCommand('weather', function(playerSource, args)
+    if not hasPermission(playerSource) then
+        reply(playerSource, 'You do not have permission to use /weather.', 'error')
+        return
     end
-  end
 
-  local h = tonumber(args[1])
-  local m = tonumber(args[2])
-  local s = tonumber(args[3] or 0)
+    local action = args[1] and string.upper(args[1]) or nil
 
-  if h == nil or m == nil then
-    local usage = 'Usage: /twopoint_settime <hour 0-23> <minute 0-59> [second 0-59]'
-    if src ~= 0 then
-      TriggerClientEvent('chat:addMessage', src, { args = { '^3TwoPoint', usage } })
-    else
-      print(usage)
+    if not action then
+        reply(playerSource, 'Usage: /weather [type|dynamic|freeze|status|resync] [transition seconds|player ID]', 'error')
+        return
     end
-    return
-  end
 
-  setTime(h, m, s)
+    if action == 'DYNAMIC' then
+        state.dynamicEnabled = true
+        state.manualUntil = 0
+        ensureForecast()
+        publishState()
+        reply(playerSource, 'Dynamic weather enabled.')
+        return
+    end
+
+    if action == 'FREEZE' or action == 'STATIC' then
+        state.dynamicEnabled = false
+        state.manualUntil = 0
+        publishState()
+        reply(playerSource, ('Dynamic weather frozen on %s.'):format(state.weatherTransition and state.weatherTransition.toWeather or state.weather))
+        return
+    end
+
+    if action == 'RESYNC' or action == 'FORCERESYNC' then
+        local targetArg = args[2] and string.lower(args[2]) or 'all'
+
+        if targetArg == 'all' or targetArg == '*' then
+            forceWeatherReset(-1)
+            reply(playerSource, ('Forced a hard weather reset for %d connected clients.'):format(#GetPlayers()))
+            return
+        end
+
+        local target = tonumber(targetArg)
+        if not target or not GetPlayerName(target) then
+            reply(playerSource, 'Invalid player ID. Use /weather resync all or /weather resync [player ID].', 'error')
+            return
+        end
+
+        forceWeatherReset(target)
+        reply(playerSource, ('Forced a hard weather reset for player %d.'):format(target))
+        return
+    end
+
+    if action == 'STATUS' or action == 'AUDIT' then
+        local transition = state.weatherTransition
+        local current = transition and transition.toWeather or state.weather
+        local acknowledged, playerCount, paused, missing, mismatched = getSyncCounts(true)
+        local missingText = #missing > 0 and (' | Missing IDs: %s'):format(table.concat(missing, ',')) or ''
+        local mismatchText = #mismatched > 0 and (' | Render mismatch: %s'):format(table.concat(mismatched, ' ')) or ''
+
+        reply(playerSource, ('Current: %s | Dynamic: %s | Transitioning: %s | Revision: %d | Render-synced clients: %d/%d | Paused: %d%s%s'):format(
+            current,
+            state.dynamicEnabled and 'yes' or 'no',
+            transition and ('yes, %ss remaining'):format(math.max(0, transition.endsAt - os.time())) or 'no',
+            stateRevision,
+            acknowledged,
+            playerCount,
+            paused,
+            missingText,
+            mismatchText
+        ))
+        return
+    end
+
+    if not Config.ValidWeather[action] then
+        reply(playerSource, ('Unknown weather type: %s'):format(action), 'error')
+        return
+    end
+
+    local duration = tonumber(args[2]) or Config.CommandTransitionSeconds
+    local manualHold = math.max(0, Config.Dynamic.ManualHoldMinutes or 0) * 60
+    state.manualUntil = state.dynamicEnabled and (os.time() + manualHold) or 0
+
+    local ok = beginWeatherTransition(action, duration, manualHold, 'admin')
+    if ok then
+        reply(playerSource, ('Weather changing to %s over %d seconds.'):format(action, math.max(1, math.floor(duration))))
+    end
 end, false)
 
--- Threads
+RegisterCommand('time', function(playerSource, args)
+    if not hasPermission(playerSource) then
+        reply(playerSource, 'You do not have permission to use /time.', 'error')
+        return
+    end
 
-CreateThread(function()
-  if not timeEnabled then return end
+    local action = args[1] and string.lower(args[1]) or nil
 
-  local broadcastEvery = (Config.Time.BroadcastIntervalSeconds or 5)
-  -- IMPORTANT: In Lua, a function call only expands multiple return values when it is
-  -- the *last* expression in an argument list. So we must capture h/m/s first.
-  if Config.Debug then
-    local sh, sm, ss = hmsFromDaySeconds(currentDaySeconds)
-    dbg(('Time sync enabled: start=%02d:%02d:%02d speed=%s gm/min broadcast=%ss'):format(
-      sh, sm, ss, tostring(gmprm), tostring(broadcastEvery)
+    if not action then
+        reply(playerSource, 'Usage: /time [hour] [minute] [transition seconds], /time freeze, /time unfreeze, /time status', 'error')
+        return
+    end
+
+    if action == 'freeze' then
+        freezeTime(true)
+        reply(playerSource, 'Time frozen.')
+        return
+    end
+
+    if action == 'unfreeze' or action == 'resume' then
+        freezeTime(false)
+        reply(playerSource, 'Time resumed.')
+        return
+    end
+
+    if action == 'status' then
+        local minutes = getCurrentTimeMinutes(os.time())
+        local hour = math.floor(minutes / 60)
+        local minute = math.floor(minutes % 60)
+        local acknowledged, playerCount = getSyncCounts(false)
+        reply(playerSource, ('Time: %02d:%02d | Frozen: %s | Speed: %.2f game min/real min | Revision: %d | Synced clients: %d/%d'):format(
+            hour,
+            minute,
+            state.time.frozen and 'yes' or 'no',
+            state.time.speed,
+            stateRevision,
+            acknowledged,
+            playerCount
+        ))
+        return
+    end
+
+    local hour = tonumber(args[1])
+    local minute = tonumber(args[2]) or 0
+    local duration = tonumber(args[3]) or Config.CommandTransitionSeconds
+    local ok = setTimeTarget(hour, minute, duration)
+
+    if not ok then
+        reply(playerSource, 'Invalid time. Use /time [0-23] [0-59] [transition seconds].', 'error')
+        return
+    end
+
+    reply(playerSource, ('Time changing to %02d:%02d over %d seconds.'):format(
+        math.floor(hour),
+        math.floor(minute),
+        math.max(1, math.floor(duration))
     ))
-  end
+end, false)
 
-  while true do
-    Wait(1000)
+exports('GetWeather', function()
+    return buildPayload().weather
+end)
 
-    -- Advance server-authority clock
-    currentDaySeconds = clampDaySeconds(currentDaySeconds + gsecsPerRealSec)
+exports('GetForecast', function()
+    return buildForecastPayload()
+end)
 
-    -- Broadcast anchor periodically
-    local now = os.time()
-    if now - lastTimeBroadcast >= broadcastEvery then
-      lastTimeBroadcast = now
-      broadcastTimeAnchor(-1)
+exports('GetTime', function()
+    return buildPayload().time
+end)
+
+exports('GetSyncStatus', function()
+    local acknowledged, playerCount, paused, missing, mismatched = getSyncCounts(true)
+    return {
+        revision = stateRevision,
+        acknowledged = acknowledged,
+        players = playerCount,
+        paused = paused,
+        missing = missing,
+        mismatched = mismatched
+    }
+end)
+
+exports('SetWeather', function(weatherType, transitionSeconds, holdSeconds)
+    return beginWeatherTransition(weatherType, transitionSeconds, holdSeconds, 'export')
+end)
+
+exports('ForceWeatherResync', function(playerId)
+    local target = tonumber(playerId) or -1
+    forceWeatherReset(target)
+    return true
+end)
+
+exports('SetTime', function(hour, minute, transitionSeconds)
+    return setTimeTarget(hour, minute, transitionSeconds)
+end)
+
+exports('SetDynamicWeather', function(enabled)
+    state.dynamicEnabled = enabled == true
+    state.manualUntil = 0
+    ensureForecast()
+    publishState()
+    return state.dynamicEnabled
+end)
+
+AddEventHandler('onResourceStart', function(resourceName)
+    if resourceName ~= RESOURCE then
+        return
     end
-  end
+
+    print(('[%s] Started with event namespace %s'):format(RESOURCE, RESOURCE))
+
+    if Config.WarnAboutConflictingResources then
+        for _, otherResource in ipairs(Config.KnownConflictingResources or {}) do
+            if otherResource ~= RESOURCE and GetResourceState(otherResource) == 'started' then
+                print(('[%s] WARNING: %s is also started and may override synchronized time/weather.'):format(RESOURCE, otherResource))
+            end
+        end
+    end
+
+    SetTimeout(1500, function()
+        broadcastState(-1)
+    end)
+end)
+
+CreateThread(function()
+    rebuildForecast()
+    updateGlobalState()
+
+    while true do
+        Wait(1000)
+        local atUnix = os.time()
+        local changed = false
+
+        if finalizeTimeTransition(atUnix) then
+            changed = true
+        end
+
+        if finalizeWeatherTransition(atUnix) then
+            changed = true
+        end
+
+        if state.dynamicEnabled and not state.weatherTransition then
+            local manualExpired = state.manualUntil == 0 or atUnix >= state.manualUntil
+            if manualExpired and atUnix >= state.weatherEndsAt then
+                ensureForecast()
+                local nextEntry = table.remove(state.forecast, 1)
+                ensureForecast()
+
+                if nextEntry then
+                    beginWeatherTransition(
+                        nextEntry.weather,
+                        nextEntry.transitionSeconds,
+                        nextEntry.durationSeconds,
+                        'dynamic'
+                    )
+                end
+            end
+        end
+
+        if changed then
+            publishState()
+        end
+    end
+end)
+
+CreateThread(function()
+    while true do
+        Wait(math.max(2, tonumber(Config.SyncIntervalSeconds) or 5) * 1000)
+        broadcastState(-1)
+    end
 end)

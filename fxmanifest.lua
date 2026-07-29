@@ -1,26 +1,17 @@
-fx_version '1.3.1'
+fx_version 'cerulean'
 game 'gta5'
 
+lua54 'yes'
+
 author 'TwoPoint Development'
-description 'Synced Tucson weather (Open-Meteo) + synced server-authority game time (not IRL) + /weather forecast UI'
+description 'TwoPointWeather: server-authoritative synced time and dynamic weather with smooth transitions and LB Phone compatibility data.'
 version '1.3.1'
 
-shared_scripts {
-  'shared/config.lua'
-}
+shared_script 'config.lua'
 
-server_scripts {
-  'server/main.lua'
-}
-
-ui_page 'html/index.html'
-
-files {
-  'html/index.html',
-  'html/style.css',
-  'html/script.js'
-}
+server_script 'server/main.lua'
 
 client_scripts {
-  'client/main.lua'
+    'client/main.lua',
+    'client/lb_phone.lua'
 }
